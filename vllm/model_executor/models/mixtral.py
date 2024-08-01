@@ -91,13 +91,28 @@ class MixtralMoE(nn.Module):
                                 tp_size=tp_size,
                                 prefix=f"{prefix}.experts")
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, w13_gpu: torch.nn.Parameter,
+                w2_gpu: torch.nn.Parameter) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            _, topk_indices = torch.topk(router_logits, 2, dim=1)
+            unique_indices = torch.unique(topk_indices.flatten())
+
+            self.experts.w13_weight.pin_memory()
+            self.experts.w2_weight.pin_memory()
+            print(f" Shape old {self.experts.w13_weight.shape}")
+            print(f"Unique indices {unique_indices}")
+            w13_gpu = self.experts.w13_weight[unique_indices.to('cpu')].to('cuda')
+
+            w2_gpu = self.experts.w2_weight[unique_indices.to('cpu')].to('cuda')
+
+        final_hidden_states = self.experts(hidden_states, router_logits, w13_gpu=w13_gpu, w2_gpu=w2_gpu, stream=stream)
+
         return final_hidden_states.view(orig_shape)
 
 
@@ -216,12 +231,14 @@ class MixtralDecoderLayer(nn.Module):
                                                 eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        residual: Optional[torch.Tensor],
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            kv_cache: torch.Tensor,
+            attn_metadata: AttentionMetadata,
+            residual: Optional[torch.Tensor],
+            w13_gpu_weights: torch.nn.Parameter,
+            w2_gpu_weights: torch.nn.Parameter,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -240,7 +257,7 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, w13_gpu=w13_gpu_weights, w2_gpu=w2_gpu_weights)
         return hidden_states, residual
 
 
@@ -252,7 +269,7 @@ class MixtralModel(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
-        prefix: str = "",
+            prefix: str = "",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -266,6 +283,10 @@ class MixtralModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
+
+        # The shape of the MoE parameters is the same for all layers so I just hard code it here
+        self.gpu_weight13 = torch.nn.Parameter(requires_grad=False)
+        self.gpu_weight2 = torch.nn.Parameter(requires_grad=False)
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -295,7 +316,7 @@ class MixtralModel(nn.Module):
             layer = self.layers[i]
             hidden_states, residual = layer(positions, hidden_states,
                                             kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
+                                            attn_metadata, residual, w13_gpu_weights=self.gpu_weight13, w2_gpu_weights=self.gpu_weight2)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

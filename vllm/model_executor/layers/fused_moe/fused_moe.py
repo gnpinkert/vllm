@@ -460,6 +460,7 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2: torch.Tensor,
                   topk_weights: torch.Tensor,
                   topk_ids: torch.Tensor,
+                  stream: torch.cuda.Stream,
                   inplace: bool = False,
                   override_config: Optional[Dict[str, Any]] = None,
                   use_fp8_w8a8: bool = False,
@@ -468,9 +469,11 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2_scale: Optional[torch.Tensor] = None,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None):
+
+    stream.synchronize()
     # Check constraints.
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
-    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    #assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
@@ -543,6 +546,7 @@ def fused_experts(hidden_states: torch.Tensor,
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
 
+
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,
                                 intermediate_cache1,
@@ -582,6 +586,10 @@ def fused_experts(hidden_states: torch.Tensor,
         torch.sum(intermediate_cache3.view(*intermediate_cache3.shape),
                   dim=1,
                   out=out_hidden_states[begin_chunk_idx:end_chunk_idx])
+
+    del w1
+    del w2
+    torch.cuda.empty_cache()
     return out_hidden_states
 
 
@@ -589,6 +597,7 @@ def fused_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    stream: torch.cuda.Stream,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
@@ -637,7 +646,7 @@ def fused_moe(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
     # Check constraints.
-    assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
+    #assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
 
     if use_grouped_topk:
         assert num_expert_group is not None and topk_group is not None
@@ -648,11 +657,20 @@ def fused_moe(
         topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
                                             renormalize)
 
-    return fused_experts(hidden_states,
-                         w1,
-                         w2,
-                         topk_weights,
-                         topk_ids,
+    unique_indices = torch.unique(topk_ids.flatten())
+
+    if unique_indices.shape[0] != 8:
+        sorted_elements, _ = torch.sort(unique_indices)
+        rank_mapping = {elem.item(): rank for rank, elem in enumerate(sorted_elements)}
+        for old_value, new_value in rank_mapping.items():
+            topk_ids[topk_ids == old_value] = new_value
+
+    return fused_experts(hidden_states=hidden_states,
+                         w1=w1,
+                         w2=w2,
+                         topk_weights=topk_weights,
+                         topk_ids=topk_ids,
+                         stream=stream,
                          inplace=inplace,
                          override_config=override_config,
                          use_fp8_w8a8=use_fp8_w8a8,
