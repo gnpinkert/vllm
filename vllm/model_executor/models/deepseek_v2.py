@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only DeepseekV2 model."""
+import queue
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -51,7 +52,8 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, SamplerOutput
 
 from .utils import PPMissingLayer, is_pp_missing_parameter, make_layers
-
+import threading
+import csv
 
 class DeepseekV2MLP(nn.Module):
 
@@ -81,7 +83,7 @@ class DeepseekV2MLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, is_prefill = False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -93,6 +95,8 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        data_queue: queue,
+        data_queue_prefill: queue,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -127,6 +131,9 @@ class DeepseekV2MoE(nn.Module):
                                      bias=False,
                                      quant_config=None,
                                      prefix=f"{prefix}.gate")
+        self.data_queue = data_queue
+        self.data_queue_prefill = data_queue_prefill
+        self.layer_count = -1
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
@@ -138,13 +145,23 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        _, topk_indices = torch.topk(router_logits, 8, dim=1)
+        for i, topk_slice in enumerate(topk_indices):
+            local_list = topk_slice.tolist()
+            local_list.append(self.layer_count)
+            if is_prefill:
+                self.data_queue_prefill.put(local_list)
+            else:
+                self.data_queue.put(local_list)
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits) * self.routed_scaling_factor
@@ -323,6 +340,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         prefix: str,
+        data_queue=queue,
+        data_queue_prefill=queue,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -332,6 +351,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
+
+        self.layer_count = -1
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
@@ -358,6 +379,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
+                data_queue=data_queue,
+                data_queue_prefill=data_queue_prefill,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -372,6 +395,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+
+    def set_layer_count(self, layer_count: int):
+        self.mlp.layer_count = layer_count
+        self.layer_count = layer_count
 
     def forward(
         self,
@@ -395,10 +422,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             attn_metadata=attn_metadata,
         )
 
+        is_prefill = positions.shape[0] != 1
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, is_prefill)
         return hidden_states, residual
 
 
@@ -425,6 +454,14 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.data_queue = queue.Queue()
+        self.data_queue_prefill = queue.Queue()
+        self.thread = threading.Thread(target=self.write_to_csv, args=("ExpertData1.csv",), daemon=True)
+        self.thread_prefill = threading.Thread(target=self.write_to_csv_prefill, args=("ExpertDataPrefill.csv",),
+                                               daemon=True)
+        self.thread.start()
+        self.thread_prefill.start()
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(
@@ -432,9 +469,14 @@ class DeepseekV2Model(nn.Module):
                 prefix,
                 cache_config=cache_config,
                 quant_config=quant_config,
+                data_queue=self.data_queue,
+                data_queue_prefill=self.data_queue_prefill,
             ),
             prefix=f"{prefix}.layers")
-
+        count = 0
+        for layer in self.layers:
+            layer.set_layer_count(count)
+            count += 1
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -470,6 +512,34 @@ class DeepseekV2Model(nn.Module):
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def write_to_csv(self, file_name):
+        with open(file_name, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            while True:
+                data = self.data_queue.get()
+                if data is None:
+                    break  # Exit condition for the thread
+                writer.writerow(data)
+                file.flush()
+                self.data_queue.task_done()
+
+    def write_to_csv_prefill(self, file_name):
+        with open(file_name, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            while True:
+                data = self.data_queue_prefill.get()
+                if data is None:
+                    break  # Exit condition for the thread
+                writer.writerow(data)
+                file.flush()
+                self.data_queue_prefill.task_done()
+    def __del__(self):
+        print(f"Object {self.name} is about to be destroyed")
+        self.data_queue.put(None)
+        self.data_queue_prefill.put(None)
+        self.thread.join()
+        self.thread_prefill.join()
 
 
 class DeepseekV2ForCausalLM(nn.Module):

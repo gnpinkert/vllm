@@ -24,6 +24,7 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer,
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, deprecate_kwargs
+import csv
 
 logger = init_logger(__name__)
 
@@ -700,6 +701,14 @@ class LLM:
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s")
                         pbar.update(1)
+        with open("ExpertData1.csv", 'a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["endseq"])
+        with open("ExpertDataPrefill.csv", 'a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['endseq'])
+
+
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.

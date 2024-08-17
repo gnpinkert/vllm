@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Mixtral model."""
+import queue
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -51,6 +52,10 @@ from .interfaces import SupportsLoRA
 from .utils import is_pp_missing_parameter, make_layers
 
 
+import threading
+import csv
+
+
 class MixtralMoE(nn.Module):
     """A tensor-parallel MoE implementation for Mixtral that shards each expert
     across all ranks.
@@ -65,6 +70,8 @@ class MixtralMoE(nn.Module):
                  top_k: int,
                  hidden_size: int,
                  intermediate_size: int,
+                 data_queue: queue,
+                 data_queue_prefill: queue,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  tp_size: Optional[int] = None,
@@ -90,13 +97,26 @@ class MixtralMoE(nn.Module):
                                 quant_config=quant_config,
                                 tp_size=tp_size,
                                 prefix=f"{prefix}.experts")
+        self.data_queue = data_queue
+        self.data_queue_prefill = data_queue_prefill
+        self.layer_count = -1
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        _, topk_indices = torch.topk(router_logits, 2, dim=1)
+        for i, topk_slice in enumerate(topk_indices):
+            local_list = topk_slice.tolist()
+            local_list.append(self.layer_count)
+            if is_prefill:
+                self.data_queue_prefill.put(local_list)
+            else:
+                self.data_queue.put(local_list)
+
         final_hidden_states = self.experts(hidden_states, router_logits)
         return final_hidden_states.view(orig_shape)
 
@@ -186,11 +206,14 @@ class MixtralDecoderLayer(nn.Module):
     def __init__(
         self,
         config: MixtralConfig,
+        data_queue: queue,
+        data_queue_prefill: queue,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_count = -1
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -209,11 +232,17 @@ class MixtralDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.block_sparse_moe")
+            prefix=f"{prefix}.block_sparse_moe",
+            data_queue=data_queue,
+            data_queue_prefill=data_queue_prefill)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+
+    def set_layer_count(self, layer_count: int):
+        self.block_sparse_moe.layer_count = layer_count
+        self.layer_count = layer_count
 
     def forward(
         self,
@@ -223,6 +252,7 @@ class MixtralDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -230,6 +260,8 @@ class MixtralDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+        is_prefill = positions.shape[0] != 1
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -240,7 +272,7 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, is_prefill)
         return hidden_states, residual
 
 
@@ -261,6 +293,12 @@ class MixtralModel(nn.Module):
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
 
+        self.data_queue = queue.Queue()
+        self.data_queue_prefill = queue.Queue()
+        self.thread = threading.Thread(target=self.write_to_csv, args=("ExpertData1.csv",), daemon=True)
+        self.thread_prefill = threading.Thread(target=self.write_to_csv_prefill, args=("ExpertDataPrefill.csv",), daemon=True)
+        self.thread.start()
+        self.thread_prefill.start()
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
@@ -270,10 +308,14 @@ class MixtralModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MixtralDecoderLayer(
-                config, cache_config, quant_config=quant_config, prefix=prefix
+                config, cache_config=cache_config, data_queue=self.data_queue, data_queue_prefill=self.data_queue_prefill, quant_config=quant_config, prefix=prefix
             ),
             prefix=f"{prefix}.layers")
 
+        count = 0
+        for layer in self.layers:
+            layer.set_layer_count(count)
+            count += 1
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -303,6 +345,34 @@ class MixtralModel(nn.Module):
             })
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+    def write_to_csv(self, file_name):
+        with open(file_name, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            while True:
+                data = self.data_queue.get()
+                if data is None:
+                    break  # Exit condition for the thread
+                writer.writerow(data)
+                file.flush()
+                self.data_queue.task_done()
+
+    def write_to_csv_prefill(self, file_name):
+        with open(file_name, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            while True:
+                data = self.data_queue_prefill.get()
+                if data is None:
+                    break  # Exit condition for the thread
+                writer.writerow(data)
+                file.flush()
+                self.data_queue_prefill.task_done()
+    def __del__(self):
+        print(f"Object {self.name} is about to be destroyed")
+        self.data_queue.put(None)
+        self.data_queue_prefill.put(None)
+        self.thread.join()
+        self.thread_prefill.join()
 
 
 class MixtralForCausalLM(nn.Module, SupportsLoRA):
