@@ -26,7 +26,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     @abstractmethod
     def apply(self, layer: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor, top_k: int, stream: torch.cuda.Stream,
-              w13_gpu: torch.nn.Parameter, w2_gpu: torch.nn.Parameter, renormalize: bool,
+              w13_gpu: torch.nn.Parameter, w2_gpu: torch.nn.Parameter, w1_cpu:torch.nn.parameter, w2_cpu: torch.nn.Parameter, renormalize: bool,
               use_grouped_topk: bool) -> torch.Tensor:
         raise NotImplementedError
 
@@ -67,6 +67,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
               stream: torch.cuda.Stream,
               w13_gpu: torch.nn.Parameter,
               w2_gpu: torch.nn.Parameter,
+              w1_cpu: torch.nn.Parameter,
+              w2_cpu: torch.nn.Parameter,
               topk_group: Optional[int] = None,
               num_expert_group: Optional[int] = None) -> torch.Tensor:
 
@@ -76,6 +78,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             top_k=top_k,
                             w1=w13_gpu,
                             w2=w2_gpu,
+                            w1_cpu=w1_cpu,
+                            w2_cpu=w2_cpu,
                             renormalize=renormalize,
                             use_grouped_topk=use_grouped_topk,
                             topk_group=topk_group,
@@ -87,6 +91,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                      x: torch.Tensor,
                      w1: torch.Tensor,
                      w2: torch.Tensor,
+                     w1_cpu: torch.Tensor,
+                     w2_cpu: torch.Tensor,
                      use_grouped_topk: bool,
                      top_k: int,
                      router_logits: torch.Tensor,
@@ -106,6 +112,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group)
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            unique_indices = torch.unique(topk_ids.flatten())
+
+            w1_cpu.pin_memory()
+            w2_cpu.pin_memory()
+            w1 = w1_cpu[unique_indices.to('cpu')].to('cuda')
+            w2 = w2_cpu[unique_indices.to('cpu')].to('cuda')
+
+        if unique_indices.shape[0] != 64:
+            sorted_elements, _ = torch.sort(unique_indices)
+            rank_mapping = {elem.item(): rank for rank, elem in enumerate(sorted_elements)}
+            for old_value, new_value in rank_mapping.items():
+                topk_ids[topk_ids == old_value] = new_value
+
 
         return fused_experts(hidden_states=x,
                              w1=w1,
@@ -295,6 +317,8 @@ class FusedMoE(torch.nn.Module):
                 router_logits: torch.Tensor,
                 w13_gpu: torch.nn.Parameter,
                 w2_gpu: torch.nn.Parameter,
+                w1_cpu: torch.nn.Parameter,
+                w2_cpu: torch.nn.Parameter,
                 stream: torch.cuda.Stream):
         assert self.quant_method is not None
 
@@ -304,6 +328,8 @@ class FusedMoE(torch.nn.Module):
             x=hidden_states,
             w13_gpu=w13_gpu,
             w2_gpu=w2_gpu,
+            w1_cpu=w1_cpu,
+            w2_cpu=w2_cpu,
             router_logits=router_logits,
             top_k=self.top_k,
             renormalize=self.renormalize,

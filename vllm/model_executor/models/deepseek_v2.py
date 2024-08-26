@@ -81,7 +81,7 @@ class DeepseekV2MLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, w13_gpu: torch.nn.Parameter = None, w2_gpu: torch.nn.Parameter = None):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -138,16 +138,25 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                w13_gpu: torch.nn.Parameter,
+                w2_gpu: torch.nn.Parameter) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        stream = None
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits) * self.routed_scaling_factor
+            router_logits=router_logits,
+            w13_gpu=w13_gpu,
+            w2_gpu=w2_gpu,
+            w1_cpu=self.experts.w13_weight,
+            w2_cpu=self.experts.w2_weight,
+            stream=stream) * self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -380,6 +389,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        w13_gpu_weights: torch.nn.Parameter,
+        w2_gpu_weights: torch.nn.Parameter,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -398,7 +409,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, w13_gpu=w13_gpu_weights, w2_gpu=w2_gpu_weights)
         return hidden_states, residual
 
 
@@ -435,6 +446,9 @@ class DeepseekV2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers")
 
+        self.gpu_weight13 = torch.nn.Parameter(requires_grad=False)
+        self.gpu_weight2 = torch.nn.Parameter(requires_grad=False)
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -458,9 +472,13 @@ class DeepseekV2Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
+            hidden_states, residual = layer(positions,
+                                            hidden_states,
                                             kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
+                                            attn_metadata,
+                                            residual,
+                                            w13_gpu_weights=self.gpu_weight13,
+                                            w2_gpu_weights=self.gpu_weight2)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({

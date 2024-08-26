@@ -659,7 +659,8 @@ def fused_moe(
 
     unique_indices = torch.unique(topk_ids.flatten())
 
-    if unique_indices.shape[0] != 8:
+    # This number needs to match the number of experts in the layer
+    if unique_indices.shape[0] != 64:
         sorted_elements, _ = torch.sort(unique_indices)
         rank_mapping = {elem.item(): rank for rank, elem in enumerate(sorted_elements)}
         for old_value, new_value in rank_mapping.items():
