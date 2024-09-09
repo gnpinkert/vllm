@@ -12,6 +12,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.model_executor.layers.fused_moe import DebugCudaEvent, MoeGpuBuffer
 
 logger = init_logger(__name__)
 
@@ -456,11 +457,10 @@ def get_config_dtype_str(dtype: torch.dtype,
 
 
 def fused_experts(hidden_states: torch.Tensor,
-                  w1: torch.Tensor,
-                  w2: torch.Tensor,
+                  moe_gpu_buffer: MoeGpuBuffer,
+                  moe_events: DebugCudaEvent,
                   topk_weights: torch.Tensor,
                   topk_ids: torch.Tensor,
-                  stream: torch.cuda.Stream,
                   inplace: bool = False,
                   override_config: Optional[Dict[str, Any]] = None,
                   use_fp8_w8a8: bool = False,
@@ -470,8 +470,9 @@ def fused_experts(hidden_states: torch.Tensor,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None):
 
-    stream.synchronize()
     # Check constraints.
+    w1 = moe_gpu_buffer.w13_gpu
+    w2 = moe_gpu_buffer.w2_gpu
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     #assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
@@ -545,8 +546,11 @@ def fused_experts(hidden_states: torch.Tensor,
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
-
-
+        """
+        print(f"Top_k IDs: {curr_topk_ids}")
+        print(f"sorted_token_ids IDs: {sorted_token_ids}")
+        print(f"expert ids: {expert_ids}")
+        """
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,
                                 intermediate_cache1,
@@ -587,9 +591,10 @@ def fused_experts(hidden_states: torch.Tensor,
                   dim=1,
                   out=out_hidden_states[begin_chunk_idx:end_chunk_idx])
 
-    del w1
-    del w2
-    torch.cuda.empty_cache()
+    # we could trigger events after the kernels are over, but i don't know how well the code works to determine
+    # how often it will loop
+    moe_events.mlp_w2_finished_event.record()
+
     return out_hidden_states
 
 
@@ -660,7 +665,8 @@ def fused_moe(
     unique_indices = torch.unique(topk_ids.flatten())
 
     # This number needs to match the number of experts in the layer
-    if unique_indices.shape[0] != 64:
+    # 64 for deepseek, 8 for Mixtral
+    if unique_indices.shape[0] != 8:
         sorted_elements, _ = torch.sort(unique_indices)
         rank_mapping = {elem.item(): rank for rank, elem in enumerate(sorted_elements)}
         for old_value, new_value in rank_mapping.items():

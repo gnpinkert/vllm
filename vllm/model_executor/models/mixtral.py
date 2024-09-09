@@ -30,7 +30,7 @@ from transformers import MixtralConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE, DebugCudaEvent, MoeGpuBuffer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
@@ -49,6 +49,8 @@ from vllm.sequence import IntermediateTensors, SamplerOutput
 
 from .interfaces import SupportsLoRA
 from .utils import is_pp_missing_parameter, make_layers
+from moe_predict import Inference
+from moe_predict.models import MixtralModelConfig
 
 
 class MixtralMoE(nn.Module):
@@ -91,27 +93,34 @@ class MixtralMoE(nn.Module):
                                 tp_size=tp_size,
                                 prefix=f"{prefix}.experts")
 
-    def forward(self, hidden_states: torch.Tensor, w13_gpu: torch.nn.Parameter,
-                w2_gpu: torch.nn.Parameter) -> torch.Tensor:
+    def load_predicted_experts(self, predicted_experts: List, moe_gpu_buffer: MoeGpuBuffer):
+        # apparently if you pin memory and then copy non blocking then you can interleave
+        # data transfer operations which is why we are using nonblocking and then sychronizing
+
+        with torch.cuda.stream(moe_gpu_buffer.load_predicted_experts_stream):
+            self.experts.w13_weight.pin_memory()
+            self.experts.w2_weight.pin_memory()
+
+            moe_gpu_buffer.w13_gpu.copy_(self.experts.w13_weight[predicted_experts].to('cuda',non_blocking=True), non_blocking=True)
+            moe_gpu_buffer.w2_gpu.copy_(self.experts.w2_weight[predicted_experts].to('cuda',non_blocking=True), non_blocking=True)
+            moe_gpu_buffer.expert_ids = predicted_experts
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                moe_gpu_buffer: MoeGpuBuffer,
+                router_event: DebugCudaEvent) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            _, topk_indices = torch.topk(router_logits, 2, dim=1)
-            unique_indices = torch.unique(topk_indices.flatten())
+        final_hidden_states = self.experts(hidden_states,
+                                           router_logits,
+                                           w1_cpu=self.experts.w13_weight,
+                                           w2_cpu=self.experts.w2_weight,
+                                           moe_gpu_buffer=moe_gpu_buffer,
+                                           router_event=router_event)
 
-            self.experts.w13_weight.pin_memory()
-            self.experts.w2_weight.pin_memory()
-            print(f" Shape old {self.experts.w13_weight.shape}")
-            print(f"Unique indices {unique_indices}")
-            w13_gpu = self.experts.w13_weight[unique_indices.to('cpu')].to('cuda')
-
-            w2_gpu = self.experts.w2_weight[unique_indices.to('cpu')].to('cuda')
-
-        final_hidden_states = self.experts(hidden_states, router_logits, w13_gpu=w13_gpu, w2_gpu=w2_gpu, stream=stream)
 
         return final_hidden_states.view(orig_shape)
 
@@ -230,6 +239,9 @@ class MixtralDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
 
+    def load_predicted_experts(self, predicted_experts: List, moe_gpu_buffer: MoeGpuBuffer):
+        self.block_sparse_moe.load_predicted_experts(predicted_experts, moe_gpu_buffer)
+
     def forward(
             self,
             positions: torch.Tensor,
@@ -237,8 +249,8 @@ class MixtralDecoderLayer(nn.Module):
             kv_cache: torch.Tensor,
             attn_metadata: AttentionMetadata,
             residual: Optional[torch.Tensor],
-            w13_gpu_weights: torch.nn.Parameter,
-            w2_gpu_weights: torch.nn.Parameter,
+            moe_gpu_buffer: MoeGpuBuffer,
+            router_event: DebugCudaEvent,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -257,7 +269,9 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states, w13_gpu=w13_gpu_weights, w2_gpu=w2_gpu_weights)
+        hidden_states = self.block_sparse_moe(hidden_states,
+                                              moe_gpu_buffer=moe_gpu_buffer,
+                                              router_event=router_event)
         return hidden_states, residual
 
 
@@ -284,9 +298,9 @@ class MixtralModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
 
-        # The shape of the MoE parameters is the same for all layers so I just hard code it here
-        self.gpu_weight13 = torch.nn.Parameter(requires_grad=False)
-        self.gpu_weight2 = torch.nn.Parameter(requires_grad=False)
+        self.drl_experts = Inference(model=MixtralModelConfig())
+
+        self.moe_gpu_buffers = MoeGpuBuffer(w13_shape=(4, 28672, 4096), w2_shape=(4, 4096, 14336))
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -296,6 +310,9 @@ class MixtralModel(nn.Module):
             prefix=f"{prefix}.layers")
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_previous = torch.zeros(62, dtype=torch.float32).to('cuda')
+        self.moe_events = DebugCudaEvent(topk=2)
+        self.mlp_stream = torch.cuda.Stream()
 
     def forward(
         self,
@@ -312,11 +329,32 @@ class MixtralModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i - self.start_layer],
-                                            attn_metadata, residual, w13_gpu_weights=self.gpu_weight13, w2_gpu_weights=self.gpu_weight2)
+
+        self.moe_events.is_first_layer = True
+        for layer_id in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_id]
+
+            with torch.cuda.stream(self.mlp_stream):
+                hidden_states, residual = layer(positions, hidden_states,
+                                                kv_caches[layer_id - self.start_layer],
+                                                attn_metadata, residual,
+                                                moe_gpu_buffer=self.moe_gpu_buffers,
+                                                router_event=self.moe_events)
+                self.moe_events.is_first_layer = False
+
+            # Don't need to predict inference for the next layer when we are on the last layer
+            if layer_id < self.end_layer - 1:
+                self.moe_events._topk_decided_event.wait()
+                predicted_experts = self.drl_experts.predict_next_experts(self.moe_events.experts, layer_id, self.norm_previous)
+                self.moe_events.mlp_w2_finished_event.wait()
+                self.layers[layer_id + 1].load_predicted_experts(predicted_experts, moe_gpu_buffer=self.moe_gpu_buffers)
+                self.norm_previous = self.drl_experts.normalize(self.norm_previous)
+                self.moe_events.reset_events()
+
+
+        # Set norm_previous to zero since the next iteration will be from a new prompt
+        self.norm_previous.zero_()
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,

@@ -1,10 +1,14 @@
 from vllm.model_executor.layers.fused_moe.layer import (FusedMoE,
-                                                        FusedMoEMethodBase)
+                                                        FusedMoEMethodBase,
+                                                        MoeGpuBuffer,
+                                                        DebugCudaEvent)
 from vllm.triton_utils import HAS_TRITON
 
 __all__ = [
     "FusedMoE",
     "FusedMoEMethodBase",
+    "MoeGpuBuffer",
+    "DebugCudaEvent",
 ]
 
 if HAS_TRITON:

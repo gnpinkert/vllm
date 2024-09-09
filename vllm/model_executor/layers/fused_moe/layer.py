@@ -11,8 +11,35 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.utils import set_weight_attrs
-
+import numpy as np
 logger = init_logger(__name__)
+
+
+class DebugCudaEvent:
+    def __init__(self, topk: int):
+        self._topk_decided_event = torch.cuda.Event()
+        self.mlp_w13_finished_event = torch.cuda.Event()
+        self.mlp_w2_finished_event = torch.cuda.Event()
+        self.experts = np.full((topk,), fill_value=0, dtype=np.int64)
+        self.is_first_layer = True
+
+    def reset_events(self):
+        self._topk_decided_event = torch.cuda.Event()
+        self.mlp_w13_finished_event = torch.cuda.Event()
+        self.mlp_w2_finished_event = torch.cuda.Event()
+
+    def triggerTopkEvent(self, experts: torch.Tensor):
+        self.experts = experts[0].cpu().numpy()
+        self._topk_decided_event.record()
+
+
+class MoeGpuBuffer:
+    def __init__(self, w13_shape: tuple[int, int, int], w2_shape: tuple[int, int, int]):
+        assert w13_shape[0] == w2_shape[0], "Moe GPU buffers must have the same number of experts"
+        self.w13_gpu = torch.nn.Parameter(torch.zeros(w13_shape), requires_grad=False)
+        self.w2_gpu = torch.nn.Parameter(torch.zeros(w2_shape), requires_grad=False)
+        self.expert_ids: List[int] = []
+        self.load_predicted_experts_stream = torch.cuda.Stream()
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
@@ -29,6 +56,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
               w13_gpu: torch.nn.Parameter, w2_gpu: torch.nn.Parameter, w1_cpu:torch.nn.parameter, w2_cpu: torch.nn.Parameter, renormalize: bool,
               use_grouped_topk: bool) -> torch.Tensor:
         raise NotImplementedError
+
+
+def find_invalid_indices(predicted_expert_ids: torch.Tensor, actual_expert_ids: torch.Tensor) -> List[int] :
+    mask = torch.isin(predicted_expert_ids, actual_expert_ids)
+    invalid_indices = torch.nonzero(~mask, as_tuple=True)[0]
+
+    return invalid_indices.tolist()
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -64,9 +98,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
               top_k: int,
               renormalize: bool,
               use_grouped_topk: bool,
-              stream: torch.cuda.Stream,
-              w13_gpu: torch.nn.Parameter,
-              w2_gpu: torch.nn.Parameter,
+              moe_gpu_buffer: MoeGpuBuffer,
+              router_event: DebugCudaEvent,
               w1_cpu: torch.nn.Parameter,
               w2_cpu: torch.nn.Parameter,
               topk_group: Optional[int] = None,
@@ -76,28 +109,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             layer=layer,
                             router_logits=router_logits,
                             top_k=top_k,
-                            w1=w13_gpu,
-                            w2=w2_gpu,
+                            moe_gpu_buffer=moe_gpu_buffer,
+                            router_event=router_event,
                             w1_cpu=w1_cpu,
                             w2_cpu=w2_cpu,
                             renormalize=renormalize,
                             use_grouped_topk=use_grouped_topk,
                             topk_group=topk_group,
-                            num_expert_group=num_expert_group,
-                            stream=stream)
+                            num_expert_group=num_expert_group,)
 
     def forward_cuda(self,
                      layer: torch.nn.Module,
                      x: torch.Tensor,
-                     w1: torch.Tensor,
-                     w2: torch.Tensor,
+                     moe_gpu_buffer: MoeGpuBuffer,
+                     router_event: DebugCudaEvent,
                      w1_cpu: torch.Tensor,
                      w2_cpu: torch.Tensor,
                      use_grouped_topk: bool,
                      top_k: int,
                      router_logits: torch.Tensor,
                      renormalize: bool,
-                     stream: torch.cuda.Stream,
                      topk_group: Optional[int] = None,
                      num_expert_group: Optional[int] = None) -> torch.Tensor:
 
@@ -113,28 +144,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group)
 
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            unique_indices = torch.unique(topk_ids.flatten())
-
+        if router_event.is_first_layer:
             w1_cpu.pin_memory()
             w2_cpu.pin_memory()
-            w1 = w1_cpu[unique_indices.to('cpu')].to('cuda')
-            w2 = w2_cpu[unique_indices.to('cpu')].to('cuda')
+            moe_gpu_buffer.w13_gpu[:top_k, :, :] = w1_cpu[topk_ids[0].tolist()].to('cuda', non_blocking=True)
+            moe_gpu_buffer.w2_gpu[:top_k, :, :] = w2_cpu[topk_ids[0].tolist()].to('cuda', non_blocking=True)
+            topk_ids[0] = torch.arange(0, top_k)
 
-        if unique_indices.shape[0] != 64:
-            sorted_elements, _ = torch.sort(unique_indices)
-            rank_mapping = {elem.item(): rank for rank, elem in enumerate(sorted_elements)}
-            for old_value, new_value in rank_mapping.items():
-                topk_ids[topk_ids == old_value] = new_value
+        else:
+            router_event.triggerTopkEvent(topk_ids)
+            invalid_indices = find_invalid_indices(torch.tensor(moe_gpu_buffer.expert_ids).to('cuda'), topk_ids[0])
+            for index in range(len(topk_ids[0])):
+                actual_id = topk_ids[0][index]
+                if actual_id not in moe_gpu_buffer.expert_ids:
+                    with torch.cuda.stream(moe_gpu_buffer.load_predicted_experts_stream):
+                        replaced_index = invalid_indices.pop(0)  # Pop the first value
+                        w1_cpu.pin_memory()
+                        w2_cpu.pin_memory()
 
+                        moe_gpu_buffer.w13_gpu[replaced_index, :, :] = w1_cpu[actual_id].to('cuda', non_blocking=True)
+                        moe_gpu_buffer.w2_gpu[replaced_index, :, :] = w2_cpu[actual_id].to('cuda', non_blocking=True)
+                        moe_gpu_buffer.expert_ids[replaced_index] = actual_id
+                        topk_ids[0][index] = replaced_index
+                else:
+                    new_index = moe_gpu_buffer.expert_ids.index(actual_id)
+                    topk_ids[0][index] = new_index
 
         return fused_experts(hidden_states=x,
-                             w1=w1,
-                             w2=w2,
-                             stream=stream,
+                             moe_gpu_buffer=moe_gpu_buffer,
                              topk_weights=topk_weights,
                              topk_ids=topk_ids,
+                             moe_events=router_event,
                              inplace=True)
 
     def forward_cpu(self, *args, **kwargs):
@@ -315,19 +355,18 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor,
-                w13_gpu: torch.nn.Parameter,
-                w2_gpu: torch.nn.Parameter,
+                moe_gpu_buffer: MoeGpuBuffer,
+                router_event: DebugCudaEvent,
                 w1_cpu: torch.nn.Parameter,
-                w2_cpu: torch.nn.Parameter,
-                stream: torch.cuda.Stream):
+                w2_cpu: torch.nn.Parameter):
         assert self.quant_method is not None
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
-            w13_gpu=w13_gpu,
-            w2_gpu=w2_gpu,
+            moe_gpu_buffer=moe_gpu_buffer,
+            router_event=router_event,
             w1_cpu=w1_cpu,
             w2_cpu=w2_cpu,
             router_logits=router_logits,
@@ -335,8 +374,7 @@ class FusedMoE(torch.nn.Module):
             renormalize=self.renormalize,
             use_grouped_topk=self.use_grouped_topk,
             topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            stream=stream)
+            num_expert_group=self.num_expert_group)
 
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
