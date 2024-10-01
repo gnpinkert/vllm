@@ -22,6 +22,7 @@ class DebugCudaEvent:
         self.mlp_w2_finished_event = torch.cuda.Event()
         self.experts = np.full((topk,), fill_value=0, dtype=np.int64)
         self.is_first_layer = True
+        self.is_prefill = False
 
     def reset_events(self):
         self._topk_decided_event = torch.cuda.Event()
@@ -143,6 +144,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group)
+
+        # Handles the prefill stage. Could have issues if the prompt is only one token long
+
+        if topk_ids.shape[0] > 1:
+            return fused_experts(hidden_states=x,
+                                 moe_gpu_buffer=moe_gpu_buffer,
+                                 topk_weights=topk_weights,
+                                 topk_ids=topk_ids,
+                                 moe_events=router_event,
+                                 inplace=True)
 
         if router_event.is_first_layer:
             w1_cpu.pin_memory()

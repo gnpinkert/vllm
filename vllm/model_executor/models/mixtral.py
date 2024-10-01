@@ -333,7 +333,6 @@ class MixtralModel(nn.Module):
         self.moe_events.is_first_layer = True
         for layer_id in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_id]
-
             with torch.cuda.stream(self.mlp_stream):
                 hidden_states, residual = layer(positions, hidden_states,
                                                 kv_caches[layer_id - self.start_layer],

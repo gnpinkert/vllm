@@ -208,7 +208,7 @@ def moe_align_block_size(
     - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
     - Then append padding tokens [12, 12, 12, 12] for each block.
     - After sorting by expert index, we obtain token_ids
-        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12]. The token IDs are sorted by expert. So everything
         Tokens 12 are non-existent (padding) and are ignored in
         the subsequent matrix multiplication.
     - The padding ensures that the total number of tokens is now divisible
@@ -546,11 +546,11 @@ def fused_experts(hidden_states: torch.Tensor,
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
-        """
+
         print(f"Top_k IDs: {curr_topk_ids}")
         print(f"sorted_token_ids IDs: {sorted_token_ids}")
         print(f"expert ids: {expert_ids}")
-        """
+
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,
                                 intermediate_cache1,
