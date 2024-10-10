@@ -87,6 +87,11 @@ class MixtralMLP(nn.Module):
         current_hidden_states = w1_out * w3_out
         current_hidden_states, _ = self.w2(current_hidden_states)
         return current_hidden_states
+    def load_to_gpu(self):
+        self.w1.load_to_gpu()
+        self.w2.load_to_gpu()
+        self.w3.load_to_gpu()
+
 
 
 class MixtralMoE(nn.Module):
@@ -126,7 +131,7 @@ class MixtralMoE(nn.Module):
                                      bias=False,
                                      quant_config=None)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, stream: torch.cuda.Stream) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
@@ -139,13 +144,14 @@ class MixtralMoE(nn.Module):
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         final_hidden_states = None
+        stream.synchronize()
         for expert_idx in self.expert_indicies:
-            expert_layer = self.experts[expert_idx]
+            expert_mlp = self.experts[expert_idx]
             expert_mask = (selected_experts == expert_idx)
             expert_weights = (routing_weights * expert_mask).sum(dim=-1,
                                                                  keepdim=True)
 
-            current_hidden_states = expert_layer(hidden_states).mul_(
+            current_hidden_states = expert_mlp(hidden_states).mul_(
                 expert_weights)
             if final_hidden_states is None:
                 final_hidden_states = current_hidden_states
@@ -268,6 +274,12 @@ class MixtralDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        prefetch_all_stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream=prefetch_all_stream):
+            for expert_idx in self.block_sparse_moe.expert_indicies:
+                expert = self.block_sparse_moe.experts[expert_idx]
+                expert.load_to_gpu()
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -285,7 +297,7 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, stream=prefetch_all_stream)
         return hidden_states, residual
 
 

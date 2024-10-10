@@ -233,10 +233,13 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
+    def load_to_gpu(self):
+        self.quant_method.load_to_gpu(layer=self)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        output = self.quant_method.apply(layer=self, x=x, bias=bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
