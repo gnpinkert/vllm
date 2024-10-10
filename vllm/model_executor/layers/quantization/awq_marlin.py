@@ -138,6 +138,10 @@ class AWQMarlinLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: AWQMarlinConfig) -> None:
         self.quant_config = quant_config
+        self.qweight_gpu = None
+
+    def load_to_gpu(self, layer: torch.nn.Module):
+        self.qweight_gpu = layer.qweight.to('cuda')
 
     def create_weights(
         self,
@@ -152,6 +156,9 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         del output_size
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
+        local_device = 'cuda'
+        if layer.__class__.__qualname__ == 'ReplicatedLinear':
+            local_device = 'cpu'
 
         # Normalize group_size
         if self.quant_config.group_size != -1:
@@ -170,6 +177,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
                 input_size_per_partition,
                 output_size_per_partition // self.quant_config.pack_factor,
                 dtype=torch.int32,
+                device=local_device
             ),
             input_dim=0,
             output_dim=1,
@@ -258,10 +266,11 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        gpu_qweight=None
     ) -> torch.Tensor:
-        return apply_awq_marlin_linear(
+        val = apply_awq_marlin_linear(
             input=x,
-            weight=layer.qweight,
+            weight=self.qweight_gpu if self.qweight_gpu is not None else layer.qweight,
             weight_scale=layer.scales,
             weight_zp=layer.qzeros,
             g_idx=layer.g_idx,
@@ -271,3 +280,10 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             output_size_per_partition=layer.output_size_per_partition,
             input_size_per_partition=layer.input_size_per_partition,
             bias=bias)
+
+        if self.qweight_gpu is not None:
+            del self.qweight_gpu
+            torch.cuda.empty_cache()
+            self.qweight_gpu = None
+
+        return val
