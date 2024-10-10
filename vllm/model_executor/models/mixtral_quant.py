@@ -87,6 +87,11 @@ class MixtralMLP(nn.Module):
         current_hidden_states = w1_out * w3_out
         current_hidden_states, _ = self.w2(current_hidden_states)
         return current_hidden_states
+    def load_to_gpu(self):
+        self.w1.load_to_gpu()
+        self.w2.load_to_gpu()
+        self.w3.load_to_gpu()
+
 
 
 class MixtralMoE(nn.Module):
@@ -136,16 +141,21 @@ class MixtralMoE(nn.Module):
         routing_weights, selected_experts = torch.topk(routing_weights,
                                                        self.top_k,
                                                        dim=-1)
+        
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         final_hidden_states = None
+        unique_values = torch.unique(selected_experts)
         for expert_idx in self.expert_indicies:
-            expert_layer = self.experts[expert_idx]
+            if expert_idx not in unique_values:
+                continue
+
+            expert_mlp = self.experts[expert_idx]
+            expert_mlp.load_to_gpu()
             expert_mask = (selected_experts == expert_idx)
             expert_weights = (routing_weights * expert_mask).sum(dim=-1,
                                                                  keepdim=True)
-
-            current_hidden_states = expert_layer(hidden_states).mul_(
+            current_hidden_states = expert_mlp(hidden_states).mul_(
                 expert_weights)
             if final_hidden_states is None:
                 final_hidden_states = current_hidden_states
