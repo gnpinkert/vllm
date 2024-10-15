@@ -159,6 +159,7 @@ class MixtralMoE(nn.Module):
 
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         if is_prefill:
+            prefill_stream = torch.cuda.Stream()
             predicted_expert_list = [-1, -1, -1, -1]
             for expert_idx in self.expert_indicies:
                 if expert_idx not in unique_values:
@@ -169,8 +170,14 @@ class MixtralMoE(nn.Module):
                 expert_weights = (routing_weights * expert_mask).sum(dim=-1,
                                                                      keepdim=True)
 
-                moe_gpu_buffer = self.load_experts([expert_idx], moe_gpu_buffer=moe_gpu_buffer)
-                                    
+                if expert_idx == 0:
+                    moe_gpu_buffer = self.load_experts([expert_idx], stream=moe_gpu_buffer.load_predicted_experts_stream, moe_gpu_buffer=moe_gpu_buffer)
+                if expert_idx < 8:
+                    with torch.cuda.stream(prefill_stream):
+                        predicted_expert_list[(expert_idx + 1) % len(predicted_expert_list)] = expert_idx
+                        predicted_expert_list[(expert_idx) % len(predicted_expert_list)] = -1
+                        moe_gpu_buffer = self.load_experts([expert_idx], stream=prefill_stream, moe_gpu_buffer=moe_gpu_buffer)
+
 
                 current_hidden_states = expert_mlp(hidden_states,
                                                    active_expert_idx=expert_idx,
@@ -187,14 +194,14 @@ class MixtralMoE(nn.Module):
         router_event.triggerTopkEvent(selected_experts)
 
         if router_event.is_first_layer:
-            moe_gpu_buffer = self.load_experts(selected_experts[0].tolist(), moe_gpu_buffer=moe_gpu_buffer)
+            moe_gpu_buffer = self.load_experts(selected_experts[0].tolist(), stream=moe_gpu_buffer.load_predicted_experts_stream, moe_gpu_buffer=moe_gpu_buffer)
         else:
             invalid_indices = find_invalid_indices(torch.tensor(moe_gpu_buffer.expert_ids).to('cuda'), selected_experts[0].to('cuda'))
             replaced_ids = []
             for expert in selected_experts[0].tolist():
                 if expert not in moe_gpu_buffer.expert_ids:
                     replaced_ids.append(expert)
-            moe_gpu_buffer = self.load_experts(experts=replaced_ids, moe_gpu_buffer=moe_gpu_buffer, invalid_indices=invalid_indices)
+            moe_gpu_buffer = self.load_experts(experts=replaced_ids, stream=moe_gpu_buffer.load_predicted_experts_stream, moe_gpu_buffer=moe_gpu_buffer, invalid_indices=invalid_indices)
 
         for expert_idx in self.expert_indicies:
             if expert_idx not in unique_values:
@@ -216,10 +223,10 @@ class MixtralMoE(nn.Module):
         return tensor_model_parallel_all_reduce(final_hidden_states).view(
             num_tokens, hidden_dim)
 
-    def load_experts(self, experts: List, moe_gpu_buffer: MoeGpuBuffer, invalid_indices = None) -> MoeGpuBuffer:
+    def load_experts(self, experts: List, moe_gpu_buffer: MoeGpuBuffer, stream: torch.cuda.Stream, invalid_indices = None) -> MoeGpuBuffer:
         # apparently if you pin memory and then copy non blocking then you can interleave
         # data transfer operations which is why we are using nonblocking and then sychronizing
-        with torch.cuda.stream(moe_gpu_buffer.load_predicted_experts_stream):
+        with torch.cuda.stream(stream):
             for predicted_idx, predicted_val in enumerate(experts):
                 if predicted_val == -1:
                     continue
@@ -454,7 +461,7 @@ class MixtralModel(nn.Module):
                 self.moe_events._topk_decided_event.wait()
                 predicted_experts = self.predictor.predict_next_experts(self.moe_events.experts[0], layer_id, self.norm_previous)
                 self.moe_events.mlp_w2_finished_event.wait()
-                self.moe_gpu_buffers = self.layers[layer_id + 1].block_sparse_moe.load_experts(predicted_experts, moe_gpu_buffer=self.moe_gpu_buffers)
+                self.moe_gpu_buffers = self.layers[layer_id + 1].block_sparse_moe.load_experts(predicted_experts, stream=self.moe_gpu_buffers.load_predicted_experts_stream, moe_gpu_buffer=self.moe_gpu_buffers)
                 self.norm_previous = self.predictor.normalize(self.norm_previous)
                 self.moe_events.reset_events()
 
