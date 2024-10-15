@@ -8,6 +8,7 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
 from .quant_utils import pack_cols, unpack_cols
+from vllm.model_executor.layers.fused_moe import DebugCudaEvent, MoeGpuBuffer, WeightClass
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
@@ -299,24 +300,43 @@ def apply_awq_marlin_linear(
         output_size_per_partition: int,
         input_size_per_partition: int,
         bias: Optional[torch.Tensor] = None,
+        moe_gpu_buffer: MoeGpuBuffer = None,
+        active_expert_idx: int = None,
         use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT) -> torch.Tensor:
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition, )
 
-    output = ops.gptq_marlin_gemm(reshaped_x,
-                                  weight,
-                                  weight_scale,
-                                  weight_zp,
-                                  g_idx,
-                                  g_idx_sort_indices,
-                                  workspace,
-                                  quant_type,
-                                  size_m=reshaped_x.shape[0],
-                                  size_n=output_size_per_partition,
-                                  size_k=input_size_per_partition,
-                                  is_k_full=True,
-                                  has_zp=True,
-                                  use_fp32_reduce=use_fp32_reduce)
+    if moe_gpu_buffer is not None:
+        assert active_expert_idx is not None, "These should both be active at the same time"
+        output = ops.gptq_marlin_gemm(reshaped_x,
+                                      moe_gpu_buffer.get_weight(active_expert_idx),
+                                      weight_scale,
+                                      weight_zp,
+                                      g_idx,
+                                      g_idx_sort_indices,
+                                      workspace,
+                                      quant_type,
+                                      size_m=reshaped_x.shape[0],
+                                      size_n=output_size_per_partition,
+                                      size_k=input_size_per_partition,
+                                      is_k_full=True,
+                                      has_zp=True,
+                                      use_fp32_reduce=use_fp32_reduce)
+    else:
+        output = ops.gptq_marlin_gemm(reshaped_x,
+                                      weight,
+                                      weight_scale,
+                                      weight_zp,
+                                      g_idx,
+                                      g_idx_sort_indices,
+                                      workspace,
+                                      quant_type,
+                                      size_m=reshaped_x.shape[0],
+                                      size_n=output_size_per_partition,
+                                      size_k=input_size_per_partition,
+                                      is_k_full=True,
+                                      has_zp=True,
+                                      use_fp32_reduce=use_fp32_reduce)
 
     if bias is not None:
         output.add_(bias)  # In-place add

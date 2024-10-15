@@ -19,6 +19,8 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            PerTensorScaleParameter,
                                            RowvLLMParameter)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.layers.fused_moe import DebugCudaEvent, MoeGpuBuffer
+
 
 logger = init_logger(__name__)
 
@@ -130,7 +132,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+              bias: Optional[torch.Tensor] = None,
+              moe_gpu_buffer = None,
+              active_expert_idx = None,
+              ) -> torch.Tensor:
 
         return F.linear(x, layer.weight, bias)
 
@@ -172,7 +177,7 @@ class LinearBase(torch.nn.Module):
             self.quant_method = quant_config.get_quant_method(self,
                                                               prefix=prefix)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, moe_gpu_buffer: MoeGpuBuffer, active_expert_idx: int) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -233,10 +238,10 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, moe_gpu_buffer: MoeGpuBuffer = None, active_expert_idx: int = None) -> torch.Tensor:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        output = self.quant_method.apply(layer=self, x=x, bias=bias, moe_gpu_buffer=moe_gpu_buffer, active_expert_idx=active_expert_idx)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
