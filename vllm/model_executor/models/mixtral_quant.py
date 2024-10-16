@@ -388,6 +388,10 @@ class MixtralDecoderLayer(nn.Module):
                                               router_event=router_event, is_prefill=is_prefill)
         return hidden_states, residual
 
+def normalize(tensor):
+    mean = tensor.mean(dim=0, keepdim=True)
+    std = tensor.std(dim=0, keepdim=True)
+    return (tensor - mean) / (std + 1e-5)
 
 class MixtralModel(nn.Module):
 
@@ -407,6 +411,7 @@ class MixtralModel(nn.Module):
         self.norm_previous = torch.zeros(62, dtype=torch.float32).to('cuda')
         self.moe_events = DebugCudaEvent(topk=2)
         self.mlp_stream = torch.cuda.Stream()
+        self.mixtral_model_config = MixtralModelConfig()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -446,6 +451,7 @@ class MixtralModel(nn.Module):
             return hidden_states
 
         self.moe_events.is_first_layer = True
+        previous_experts = torch.zeros((self.mixtral_model_config.num_layers - 1) * 2)
         for layer_id in range(len(self.layers)):
             layer = self.layers[layer_id]
             with torch.cuda.stream(self.mlp_stream):
@@ -459,10 +465,12 @@ class MixtralModel(nn.Module):
 
             if layer_id < len(self.layers) - 1:
                 self.moe_events._topk_decided_event.wait()
+                previous_experts[layer_id * 2] = self.moe_events.experts[0][0]
+                previous_experts[layer_id * 2 + 1] = self.moe_events.experts[0][1]
+                self.norm_previous = normalize(previous_experts).to('cuda')
                 predicted_experts = self.predictor.predict_next_experts(self.moe_events.experts[0], layer_id, self.norm_previous)
                 self.moe_events.mlp_w2_finished_event.wait()
-                self.moe_gpu_buffers = self.layers[layer_id + 1].block_sparse_moe.load_experts(predicted_experts, stream=self.moe_gpu_buffers.load_predicted_experts_stream, moe_gpu_buffer=self.moe_gpu_buffers)
-                self.norm_previous = self.predictor.normalize(self.norm_previous)
+                self.moe_gpu_buffers = self.layers[layer_id + 1].block_sparse_moe.load_experts(predicted_experts[0], stream=self.moe_gpu_buffers.load_predicted_experts_stream, moe_gpu_buffer=self.moe_gpu_buffers)
                 self.moe_events.reset_events()
 
                 # Set norm_previous to zero since the next iteration will be from a new prompt
