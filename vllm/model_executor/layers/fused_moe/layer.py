@@ -56,7 +56,7 @@ class MoeGpuBuffer:
         self.qweight_w1s = torch.nn.Parameter(torch.zeros(shape_tuple + w1s_shape, device='cuda', dtype=torch.int32), requires_grad=False)
         self.qweight_w2s = torch.nn.Parameter(torch.zeros(shape_tuple + w2s_shape, device='cuda', dtype=torch.int32), requires_grad=False)
         self.qweight_w3s = torch.nn.Parameter(torch.zeros(shape_tuple + w3s_shape, device='cuda', dtype=torch.int32), requires_grad=False)
-        self.expert_ids: List[int] = [-1, -1, -1, -1]
+        self.expert_ids: List[int] = [-1, -1]
         self.load_predicted_experts_stream = torch.cuda.Stream()
         self.current_weight_class: WeightClass = WeightClass.UNKNOWN
 

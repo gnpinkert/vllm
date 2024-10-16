@@ -156,28 +156,34 @@ class MixtralMoE(nn.Module):
 
         final_hidden_states = None
         unique_values = torch.unique(selected_experts)
-
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         if is_prefill:
+            first_index = unique_values[0]
             prefill_stream = torch.cuda.Stream()
-            predicted_expert_list = [-1, -1, -1, -1]
+            predicted_expert_list = [-1, -1]
             for expert_idx in self.expert_indicies:
                 if expert_idx not in unique_values:
                     continue
-
                 expert_mlp = self.experts[expert_idx]
                 expert_mask = (selected_experts == expert_idx)
                 expert_weights = (routing_weights * expert_mask).sum(dim=-1,
                                                                      keepdim=True)
 
-                if expert_idx == 0:
-                    moe_gpu_buffer = self.load_experts([expert_idx], stream=moe_gpu_buffer.load_predicted_experts_stream, moe_gpu_buffer=moe_gpu_buffer)
-                if expert_idx < 8:
-                    with torch.cuda.stream(prefill_stream):
-                        predicted_expert_list[(expert_idx + 1) % len(predicted_expert_list)] = expert_idx
-                        predicted_expert_list[(expert_idx) % len(predicted_expert_list)] = -1
-                        moe_gpu_buffer = self.load_experts([expert_idx], stream=prefill_stream, moe_gpu_buffer=moe_gpu_buffer)
+                if expert_idx == first_index:
+                    predicted_expert_list[0] = expert_idx
+                    moe_gpu_buffer = self.load_experts(predicted_expert_list, stream=moe_gpu_buffer.load_predicted_experts_stream, moe_gpu_buffer=moe_gpu_buffer)
 
+                with torch.cuda.stream(prefill_stream):
+                    if expert_idx < 7:
+                        next_id = expert_idx + 1
+                        while next_id not in unique_values and next_id < 9:
+                            next_id += 1
+                        if next_id < 8:
+                                prev_index = predicted_expert_list.index(expert_idx)
+                                next_index = 1 - prev_index
+                                predicted_expert_list[next_index] = next_id
+                                predicted_expert_list[prev_index] = -1
+                                moe_gpu_buffer = self.load_experts(predicted_expert_list, stream=prefill_stream, moe_gpu_buffer=moe_gpu_buffer)
 
                 current_hidden_states = expert_mlp(hidden_states,
                                                    active_expert_idx=expert_idx,
@@ -406,7 +412,7 @@ class MixtralModel(nn.Module):
         self.vocab_size = config.vocab_size
 
         self.predictor = Inference(model=MixtralModelConfig())
-        self.moe_gpu_buffers = MoeGpuBuffer(num_experts=4, w1s_shape=(256, 28672), w2s_shape=(896, 8192),
+        self.moe_gpu_buffers = MoeGpuBuffer(num_experts=2, w1s_shape=(256, 28672), w2s_shape=(896, 8192),
                                             w3s_shape=(256, 28672))
         self.norm_previous = torch.zeros(62, dtype=torch.float32).to('cuda')
         self.moe_events = DebugCudaEvent(topk=2)
@@ -436,7 +442,6 @@ class MixtralModel(nn.Module):
         residual = None
 
         is_prefill = input_ids.size(0) > 1
-
         if is_prefill:
             for i in range(len(self.layers)):
                 layer = self.layers[i]
