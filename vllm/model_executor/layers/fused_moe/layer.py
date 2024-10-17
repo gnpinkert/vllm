@@ -2,6 +2,8 @@ from abc import abstractmethod
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
+import numpy as np
+
 import torch
 
 from vllm.distributed import (get_tensor_model_parallel_rank,
@@ -20,6 +22,59 @@ class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
     GROUP = "group"
+
+class DebugCudaEvent:
+    def __init__(self, topk: int):
+        self._topk_decided_event = torch.cuda.Event()
+        self.mlp_w13_finished_event = torch.cuda.Event()
+        self.mlp_w2_finished_event = torch.cuda.Event()
+        self.experts = np.full((topk,), fill_value=0, dtype=np.int64)
+        self.is_first_layer = True
+
+    def reset_events(self):
+        self._topk_decided_event = torch.cuda.Event()
+        self.mlp_w13_finished_event = torch.cuda.Event()
+        self.mlp_w2_finished_event = torch.cuda.Event()
+
+    def triggerTopkEvent(self, experts: torch.Tensor):
+        assert experts.shape == (1,2), "Shape should be the TopK value for your model. For mixtral, that is two"
+        self.experts = experts.cpu().numpy()
+        self._topk_decided_event.record()
+
+
+class WeightClass(Enum):
+    UNKNOWN = 0
+    W1 = 1
+    W2 = 2
+    W3 = 3
+
+
+class MoeGpuBuffer:
+
+    def __init__(self, num_experts: int, w1s_shape: tuple[int, int], w2s_shape: tuple[int, int], w3s_shape: tuple[int, int]):
+        shape_tuple = (num_experts,)
+        self.qweight_w1s = torch.nn.Parameter(torch.zeros(shape_tuple + w1s_shape, device='cuda', dtype=torch.int32), requires_grad=False)
+        self.qweight_w2s = torch.nn.Parameter(torch.zeros(shape_tuple + w2s_shape, device='cuda', dtype=torch.int32), requires_grad=False)
+        self.qweight_w3s = torch.nn.Parameter(torch.zeros(shape_tuple + w3s_shape, device='cuda', dtype=torch.int32), requires_grad=False)
+        self.expert_ids: List[int] = [-1, -1]
+        self.load_predicted_experts_stream = torch.cuda.Stream()
+        self.current_weight_class: WeightClass = WeightClass.UNKNOWN
+
+    def set_weight_class(self, type: str):
+        self.current_weight_class = WeightClass[type]
+
+    def get_weight(self, expert_id: int):
+        real_index = self.expert_ids.index(expert_id)
+        match self.current_weight_class:
+            case WeightClass.W1:
+                return self.qweight_w1s[real_index,:,:]
+            case WeightClass.W2:
+                return self.qweight_w2s[real_index,:,:]
+            case WeightClass.W3:
+                return self.qweight_w3s[real_index,:,:]
+            case _:
+                raise ValueError(f"Invalid weight class {self.current_weight_class}")
+
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
